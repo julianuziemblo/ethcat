@@ -1,0 +1,241 @@
+import socket
+import random
+import getmac
+import argparse
+import time
+
+
+ETH_P_ALL = 0x0003
+ETH_MAX_FL = 1500
+ETH_HWADDR_LEN = 6
+ETH_ETHERTYPE_LEN = 2
+ETH_HEADER_LEN = (2 * ETH_HWADDR_LEN) + ETH_ETHERTYPE_LEN
+ETH_ADDR_STR_LEN = (2 * ETH_HWADDR_LEN) + 5 # 5 times ':'
+DEFAULT_PAYLOAD = 'hello from host!'
+ENCODING = 'ascii'
+
+FILTER_OBJS = {
+    'dst',
+    'src',
+    'ethtype',
+}
+
+
+def parse_addr(addr: str) -> bytearray:
+    try:
+        parsed = bytearray([int(x, 16) for x in addr.split(':')])
+        if len(parsed) != 6:
+            raise Exception
+    except Exception:
+        raise argparse.ArgumentTypeError('invalid MAC format: should be `AA:BB:CC:DD:EE:FF`')
+    
+    return parsed
+
+
+def hwaddr_to_str(addr: bytes) -> str:
+    return ':'.join(f'{b:02x}' for b in addr)
+
+
+def send_frame(so, src: str, dst: str, ethtype: bytes, payload: bytes):
+    packet = parse_addr(dst) + parse_addr(src) + bytearray(ethtype) + bytearray(payload)
+    # print(f'sending packet: {packet}, {len(packet)=}')
+    return so.send(packet)
+
+
+def check_bytes_type(arg):
+    if arg == 'longest':
+        return arg
+    
+    val = 0
+    try:
+        val = int(arg)
+        if not(0 <= val <= ETH_MAX_FL):
+            raise ValueError()
+    except ValueError:
+        raise argparse.ArgumentTypeError('bytes should be [0 - 1500] or \'longest\'')
+    
+    return val
+
+
+def check_filter(f: str) -> str:
+    dst = 0
+    src = 0
+    ethtype = 0
+    try:
+        eval(f)
+    except Exception as e:
+        raise argparse.ArgumentTypeError(f'bad argument: {e}\n\tsupported objs: {FILTER_OBJS}')
+    return f
+
+
+def satisfies_filter(packet: bytes, f: str) -> bool:
+    dst = hwaddr_to_str(packet[0:6:])
+    src = hwaddr_to_str(packet[6:12:])
+    ethtype = hwaddr_to_str(packet[12:14:])
+    return eval(f)
+
+
+def hexdump_frame(frame: bytes, columns=16):
+    for i, b in enumerate(frame):
+        if i != 0 and i % columns == 0:
+            print('')
+        print(f'{b:02x}', end=' ')
+    print('')
+
+
+def handle_send(so, args):
+    try:
+        for i in range(args.count):
+            res = send_frame(so, args.src, args.dst, args.ethtype, args.payload)
+            print(f'{f"[{i + 1}] " if args.count != 1 else ""}sent {res} bytes')
+            time.sleep(0.1)
+    except argparse.ArgumentTypeError as ate:
+        print(f'{ate}')
+        exit(0)
+
+
+def handle_recv_echo(so, args):
+    try:
+        cnt = 0
+        print(f'waiting to receive frame {cnt + 1}...')
+        while cnt < args.count:
+            frame = so.recv(args.bufsiz)
+            if not args.filter or satisfies_filter(frame, args.filter):
+                print(f'{cnt}. [{time.time():.3}] new frame: {len(frame)}B {frame if args.verbose >= 2 else ""}')
+                if args.verbose >= 1:
+                    hexdump_frame(frame)
+            else:
+                continue
+            cnt += 1
+            if args.mode == 'echo':
+                res = send_frame(so, hwaddr_to_str(frame[6:12:]), hwaddr_to_str(frame[0:6:]), frame[12:14:], frame)
+                if args.verbose:
+                    print(f'sent {res} bytes')
+            print('')
+    except argparse.ArgumentTypeError as ate:
+        print(f'{ate}')
+        exit(0)
+
+
+MODES = {
+    'send': handle_send,
+    'recv': handle_recv_echo,
+    'echo': handle_recv_echo,
+}
+
+
+def setup():
+    parser = argparse.ArgumentParser(prog='ethutil', description='send and receive raw ethernet frames')
+
+    parser.add_argument('mode', choices=MODES.keys(), 
+                        help=f'operation modes: ({"|".join(MODES.keys())})')
+
+    parser.add_argument('iface', help='source interface name')
+
+    parser.add_argument('-c', '--count', 
+                    required=False, 
+                    type=int,
+                    help='number of packets to send/receive')
+
+    # SEND    
+    parser.add_argument('-d', '--dst',
+                        help='destination MAC')
+    
+    parser.add_argument('-t', '--ethtype', 
+                        required=False,
+                        type=lambda arg: int(arg, base=0),
+                        help='Ethtype')
+    
+    parser.add_argument('-p', '--payload',
+                        required=False,
+                        default=None,
+                        help='message payload')
+    
+    parser.add_argument('-b', '--bytes',
+                        required=False,
+                        type=check_bytes_type,
+                        help='number of random bytes in the packet')
+    
+    # RECV, ECHO
+    parser.add_argument('-B', '--bufsiz',
+                        required=False,
+                        type=int,
+                        help='size of the receive buffer (in bytes)')
+    
+    parser.add_argument('-f', '--filter',
+                        required=False,
+                        type=check_filter,
+                        help=f'receive only packets matching (python syntax)\nsupported objects: {FILTER_OBJS}')
+    
+    parser.add_argument('-v', '--verbose',
+                        required=False,
+                        action='count',
+                        help='verbosely display received packets')
+
+
+    args = parser.parse_args()
+
+    if args.mode == 'send' and not args.dst:
+        parser.error('missing required argument (-d | --dst)')
+
+    if args.mode == 'recv' and any([args.dst, args.payload, args.bytes, args.ethtype]):
+        parser.error('-d, -t, -p and -b cannot be applied in RECV mode')
+
+    if args.mode == 'send' and any([args.bufsiz, args.filter]):
+        parser.error('-B and -f cannot be applied in SEND mode')
+
+    return args, parser
+
+
+# ethutl send [hello|msg|longest|burst] 
+#   -c | --count        number of packets to send, on default: 1
+#   -d | --destination  destination MAC
+#   -s | --source       source MAC, on default: hwaddr of source iface
+#   -i | --interface    source interface name
+#   -t | --ethtype      Ethtype, on default: ETH_P_ALL (0x0003)
+if __name__ == '__main__':
+    args, parser = setup()
+    # print(args._get_args)
+    with socket.socket(socket.AF_PACKET, socket.SOCK_RAW) as so:
+        args.src = getmac.get_mac_address(interface=args.iface)
+        args.dst = args.dst
+
+        if args.count is None:
+            if args.mode == 'echo':
+                args.count = float('infinity')
+            else:
+                args.count = 1
+
+        if args.ethtype is None:
+            args.ethtype = ETH_P_ALL
+
+        ethtype = args.ethtype
+        args.ethtype = bytes([(args.ethtype >> 8) & 0xff, args.ethtype & 0xff])
+        encode_payload = True
+
+        if args.payload != None and args.bytes != None:
+            parser.error('only one of (-p|--payload) and (-b|--bytes) options can be specified at once!')
+
+        if args.bytes == 'longest':
+            args.bytes = ETH_MAX_FL
+
+        if args.bytes != None:
+            if not(0 <= args.bytes <= ETH_MAX_FL):
+                parser.error(f'bytes can only be within range [0, {ETH_MAX_FL}] (inclusive)')
+            args.payload = random.randbytes(args.bytes)
+            encode_payload = False
+
+        if args.payload == None:
+            args.payload = DEFAULT_PAYLOAD
+
+        if encode_payload:
+            args.payload = payload = bytes(args.payload, encoding=ENCODING)
+        else:
+            args.payload = payload = args.payload
+
+        if args.bufsiz is None:
+            args.bufsiz = ETH_MAX_FL + ETH_HEADER_LEN
+        
+        so.bind((args.iface, ethtype))
+
+        MODES[args.mode](so, args)

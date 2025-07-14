@@ -1,4 +1,4 @@
-# `ethutil`
+# `ethcat`
 Send and receive raw Ethernet frames.
 
 ## Running

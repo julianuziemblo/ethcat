@@ -229,9 +229,7 @@ if __name__ == '__main__':
             args.payload = DEFAULT_PAYLOAD
 
         if encode_payload:
-            args.payload = payload = bytes(args.payload, encoding=ENCODING)
-        else:
-            args.payload = payload = args.payload
+            args.payload = bytes(args.payload, encoding=ENCODING)
 
         if args.bufsiz is None:
             args.bufsiz = ETH_MAX_FL + ETH_HEADER_LEN
